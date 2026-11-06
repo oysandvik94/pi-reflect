@@ -52,7 +52,8 @@ export function createSessionFixture(
 	for (const opt of opts) {
 		const projectDir = path.join(sessionsDir, opt.projectDirName);
 		fs.mkdirSync(projectDir, { recursive: true });
-		const content = buildSessionJsonl(opt.exchanges);
+		const timestamp = new Date(`${opt.fileName.slice(0, 10)}T12:00:00`).toISOString();
+		const content = buildSessionJsonl(opt.exchanges).trim().split("\n").map((line, i) => JSON.stringify({ ...JSON.parse(line), id: `message-${i}`, timestamp })).join("\n") + "\n";
 		fs.writeFileSync(path.join(projectDir, opt.fileName), content, "utf-8");
 	}
 	return sessionsDir;

@@ -16,12 +16,12 @@
   "author": "Pradeep Elankumaran <pradeepe@gmail.com>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jo-inc/pi-reflect.git"
+    "url": "https://github.com/oysandvik94/pi-reflect.git"
   },
   "bugs": {
-    "url": "https://github.com/jo-inc/pi-reflect/issues"
+    "url": "https://github.com/oysandvik94/pi-reflect/issues"
   },
-  "homepage": "https://github.com/jo-inc/pi-reflect#readme",
+  "homepage": "https://github.com/oysandvik94/pi-reflect#readme",
   "type": "module",
   "scripts": {
     "test": "node --import tsx --test tests/*.test.ts"
@@ -36,8 +36,8 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.1",
-    "@earendil-works/pi-ai": "^0.81.1"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
   },
   "devDependencies": {
     "tsx": "^4.19.0",

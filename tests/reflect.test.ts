@@ -348,10 +348,10 @@ describe("buildReflectionPrompt", () => {
 		assert.ok(prompt.includes("fix this"));
 	});
 
-	it("includes conciseness instructions", () => {
+	it("requires evidence rather than shorter rules", () => {
 		const prompt = buildReflectionPrompt("/AGENTS.md", "content", "transcripts");
-		assert.ok(prompt.includes("Conciseness"));
-		assert.ok(prompt.includes("SHORTER"));
+		assert.ok(prompt.includes("verified new corrections"));
+		assert.ok(!prompt.includes("SHORTER"));
 	});
 
 	it("includes all edit types in instructions", () => {

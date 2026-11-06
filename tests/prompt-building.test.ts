@@ -41,9 +41,9 @@ describe("buildReflectionPrompt", () => {
 		assert.ok(prompt.includes("merge_sources"));
 	});
 
-	it("requires 2+ occurrences for new rules", () => {
+	it("requires corrections from two sessions for new rules", () => {
 		const prompt = buildReflectionPrompt("/AGENTS.md", "content", "transcripts");
-		assert.ok(prompt.includes("2+ occurrences"));
+		assert.ok(prompt.includes("at least two distinct sessions"));
 	});
 
 	it("lists correction signals to look for", () => {

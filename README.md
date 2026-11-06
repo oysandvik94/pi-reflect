@@ -15,17 +15,17 @@ Iterative self-improvement for [pi](https://github.com/badlogic/pi-mono) coding 
 
 Define a target — how your agent should behave, what it should remember, who it should be — and reflect iterates toward it. Each run reads recent conversations and reference material, compares the agent's actual behavior against the target, and makes surgical edits to close the gap.
 
-**define the target → reflect reads evidence → edits the file → the agent gets closer.**
+**define the target → inspect evidence → apply safe additions or hold proposals → evaluate later outcomes.**
 
 Works on any markdown file: behavioral rules (`AGENTS.md`), long-term memory (`MEMORY.md`), personality (`SOUL.md`), or anything else.
 
 ## Install
 
 ```bash
-pi install git:github.com/jo-inc/pi-reflect
+pi install git:github.com/oysandvik94/pi-reflect
 ```
 
-Requires pi with an LLM API key configured. Each run makes one LLM call (~$0.05–0.15 with Sonnet).
+Requires Pi with model authentication configured. Large transcript sets use multiple calls. Run records report actual provider usage when available; subscription usage is not an exact bill.
 
 ## Usage
 
@@ -34,7 +34,7 @@ Requires pi with an LLM API key configured. Each run makes one LLM call (~$0.05�
 /reflect                    # use saved default target
 /reflect-config             # show configured targets
 /reflect-history            # show recent runs
-/reflect-stats              # correction rate trend + rule recidivism
+/reflect-stats              # run health, descriptive rates, and rule churn
 /reflect-backfill           # bootstrap stats for all historical sessions
 ```
 
@@ -45,11 +45,11 @@ First run asks if you want to save the target. After that, just `/reflect`.
 1. Collects evidence: conversation transcripts, daily logs, reference files — from any combination of sources
 2. Sends the evidence + the target file + a prompt describing the desired end state to an LLM
 3. The LLM identifies gaps between actual behavior and the target, proposes surgical edits
-4. Edits are applied with safety checks: backs up the original, skips ambiguous matches, rejects suspiciously large deletions, auto-commits to git if the target is in a repo
+4. Proposals cite literal user messages with stable evidence identifiers. Automatic additions require independent new evidence from at least two sessions. Previously applied evidence is not reused as a new correction.
+5. Replacements, removals, merges, and potentially sensitive additions are held for human approval. Safety screening is conservative, not a proof of semantic correctness. Pending proposals retain their exact text and reasons in history; approval means reviewing and manually applying the specific change, not disabling the gate.
+6. All batches are staged in memory. Any analysis failure prevents the run from applying changes. Successful writes verify the target has not changed and create a rollback snapshot first. Dry runs never edit targets or create backups. Reflection never commits or pushes.
 
-Every edit is versioned — reflect auto-commits to git after applying changes, so you get a full history of how each file evolved. `git log AGENTS.md` shows every correction the agent absorbed. `git diff HEAD~5 SOUL.md` shows how the personality sharpened over the last 5 runs.
-
-Over time, the file converges: corrections get absorbed as rules, memory accumulates durable facts, personality sharpens from generic to specific. The agent stops needing the same corrections.
+Improvement is a hypothesis to evaluate against subsequent relevant tasks, not a consequence of editing instructions. No change warranted is a successful analysis. File size and edit counts are descriptive only.
 
 ## Data sources
 
@@ -107,15 +107,32 @@ Prompts use `{fileName}`, `{targetContent}`, `{transcripts}`, and `{context}` as
 
 If no prompt is set, the default targets behavioral corrections (the original use case).
 
-## Impact Metrics
+## Run health and outcomes
 
-`/reflect-stats` tracks whether reflection is working:
+`/reflect-stats` shows successful-analysis correction counts and rule churn. It does **not** infer improvement from corrections/session or resolution from a section being edited once. Rolling windows overlap, task mix changes, and missing corrections do not prove success.
 
-- **Correction Rate** — `corrections / sessions` per run, plotted over time. Trending down = the agent is converging.
+Run history distinguishes `success`, `partial`, `failed`, and `no_data`, extracted versus analyzed sessions, successful/failed batches, proposed/applied/skipped/held changes, duration, and available provider usage. Failed and partial runs have no correction rate. Historical entries without explicit health remain unverified; they are not rewritten or promoted to successful results.
 
-- **Rule Recidivism** — which sections get edited repeatedly. A rule strengthened 3+ times isn't sticking. Sections edited once and never again are resolved.
+`/reflect-backfill` analyzes historical sessions without changing targets or marking evidence handled. It still records its dry-run analysis in history.
 
-`/reflect-backfill` bootstraps stats from historical sessions (dry-run, no file edits).
+### Daily and weekly reports
+
+Python 3 renders standalone HTML with no network assets or model call:
+
+```sh
+python3 scripts/reflection_report.py --run
+# Output JSON identifies the new run envelope, daily HTML, and rolling-week HTML.
+python3 scripts/reflection_report.py --run-file /path/to/run.json \
+  --skills /path/to/skill-usage.json --observations /path/to/observations.json
+```
+
+`--run` executes only this extension, without other extensions, skills, tools, templates, or context files, with a ten-minute timeout. Current-run records, not the newest backup, determine today's changes. Historical HTML is preserved. Reports lead with health, decisions, new changes, and outcomes; full diffs and citations are collapsible.
+
+Optional observation JSON has `outcomes`, `skills`, and `failures` arrays. Outcomes contain a `ruleId` or `skill`, `result` (`opportunity`, `success`, or `correction`), `explanation`, and `evidence`: objects with `sessionFile`, `messageId`, and literal `quote`. The renderer checks archive boundaries, message IDs, quotations, and that evidence follows the recorded rule change or skill observation baseline. Interpretation remains model judgment. Skill first-observed dates are not creation dates. Unknown opportunities and outcomes remain unknown.
+
+New skill candidates use `name`, complete `content` (including frontmatter), `reason`, and the same evidence shape. `--apply-skills` creates at most two new low-risk skills with verified user evidence from independent sessions. It never alters existing skills, executes skill content, or treats inactivity as grounds for removal. Potential permissions, mutations, and executable instructions are held for approval. Read existing skill descriptions before proposing a candidate; the mechanical validator cannot establish semantic novelty.
+
+Rolling weekly reports deduplicate reviewed outcome citations and link daily details. They do not compute a success rate from overlapping session counts or infer savings. Run costs cover nested reflection only; scheduler, digest review, and skill analysis overhead are separate.
 
 ## Configuration
 
@@ -138,6 +155,7 @@ If no prompt is set, the default targets behavioral corrections (the original us
 |-------|---------|-------------|
 | `path` | *(required)* | Target markdown file to iterate on |
 | `model` | *(required)* | LLM to use (e.g. `anthropic/claude-sonnet-4-5`) |
+| `reasoning` | provider default | Explicit supported reasoning level; set this for models that reject the provider default |
 | `lookbackDays` | `1` | How far back to look for evidence |
 | `maxSessionBytes` | `614400` | Max transcript bytes per run |
 | `transcripts` | — | Array of `ContextSource` for transcript data |
@@ -162,7 +180,8 @@ Works with cron, launchd, or any scheduler. Ask your pi to set it up for you —
 
 ```bash
 git clone https://github.com/jo-inc/pi-reflect && cd pi-reflect
-npm install && npm test   # 137 tests
+npm install && npm test
+python3 -m unittest discover -s tests -p '*_test.py'
 pi -e ./extensions/index.ts   # test locally without installing
 ```
 

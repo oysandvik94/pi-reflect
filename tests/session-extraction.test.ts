@@ -206,7 +206,7 @@ describe("formatSessionTranscript", () => {
 		];
 		const result = formatSessionTranscript(exchanges, "2026-02-12 03:00", "myproject");
 		assert.ok(result.includes("### Session: myproject [2026-02-12 03:00]"));
-		assert.ok(result.includes("**USER:** Hello"));
+		assert.ok(result.includes("**USER** [sessionId=unknown messageId=unknown timestamp=unknown]: Hello"));
 		assert.ok(result.includes("**AGENT:** Hi there"));
 	});
 
@@ -291,7 +291,7 @@ describe("collectTranscripts", () => {
 		assert.equal(result.includedCount, 0);
 	});
 
-	it("skips sessions with fewer than 3 exchanges", async () => {
+	it("includes short sessions with recent user messages", async () => {
 		const yesterday = new Date();
 		yesterday.setDate(yesterday.getDate() - 1);
 		const dateStr = yesterday.toISOString().slice(0, 10);
@@ -306,9 +306,8 @@ describe("collectTranscripts", () => {
 		}]);
 
 		const result = await collectTranscripts(1, 1024 * 1024, sessionsDir);
-		// Scanned but not included
 		assert.equal(result.sessionCount, 1);
-		assert.equal(result.includedCount, 0);
+		assert.equal(result.includedCount, 1);
 	});
 
 	it("skips sessions with 0 user messages", async () => {

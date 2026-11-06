@@ -5,7 +5,7 @@
  *   /reflect [path]      — Run reflection on a file (or configured default)
  *   /reflect-config      — Show/edit reflection configuration
  *   /reflect-history     — Show recent reflection runs
- *   /reflect-stats       — Show impact metrics (correction rate trend + rule recidivism)
+ *   /reflect-stats       — Show run health and descriptive change metrics
  *   /reflect-backfill    — Backfill stats for all historical session dates
  *
  * Headless execution for cron/launchd:
@@ -108,18 +108,19 @@ export default function (pi: ExtensionAPI) {
 				? (msg, level) => ctx.ui.notify(msg, level)
 				: (msg, level) => console.log(`[reflect] [${level}] ${msg}`);
 
-			// Run configured targets sequentially to avoid provider concurrency spikes,
-			// and persist each successful result immediately.
+			// Persist failed and partial analyses too; absence of findings is not success.
 			let completed = 0;
 			let failed = 0;
 			for (const target of targets) {
 				try {
 					const run = await runReflection(target, modelRegistryRef, notify, undefined, {});
 					if (run) {
+						if (process.env.PI_REFLECT_INVOCATION_ID) run.invocationId = process.env.PI_REFLECT_INVOCATION_ID;
 						const history = loadHistory();
 						history.push(run);
 						saveHistory(history);
-						completed++;
+						if (run.status === "success" || run.status === "no_data") completed++;
+						else failed++;
 					} else {
 						failed++;
 					}
@@ -176,7 +177,7 @@ export default function (pi: ExtensionAPI) {
 			const lines = recent.map((r) => {
 				const date = r.timestamp.slice(0, 16).replace("T", " ");
 				const file = targetLabel(r.targetPath);
-				return `- **${date}** ${file}: ${r.editsApplied} edits, ${r.correctionsFound} corrections (${r.sessionsAnalyzed} sessions)\n  ${r.summary}`;
+				return `- **${date}** ${file}: ${r.status ?? "unverified historical run"}; ${r.editsApplied} applied edits; ${r.sessionsAnalyzed} analyzed sessions\n  ${r.summary}`;
 			});
 
 			if (ctx.hasUI) {
@@ -189,7 +190,7 @@ export default function (pi: ExtensionAPI) {
 
 	// /reflect-stats — show impact metrics
 	pi.registerCommand("reflect-stats", {
-		description: "Show reflection impact metrics: correction rate trend and rule recidivism, grouped by target file",
+		description: "Show run health and descriptive metrics, not inferred behavioral improvement",
 		handler: async (args, ctx) => {
 			const history = loadHistory();
 
@@ -278,9 +279,11 @@ export default function (pi: ExtensionAPI) {
 				output.push("### Correction Rate (corrections per session)");
 				output.push("");
 
-				const ratesWithDates = runs.map((r) => ({
+				output.push("Only successful non-dry-run analyses with known rates appear below. Counts are model estimates, not verified outcome rates. Overlapping windows and task mix prevent causal comparisons.");
+				output.push(`Other runs: ${runs.filter((r) => r.status !== "success").length} failed, partial, empty, or historically unverified.`);
+				const ratesWithDates = runs.filter((r) => r.status === "success" && !r.dryRun && typeof r.correctionRate === "number").map((r) => ({
 					sourceDate: getSourceDate(r),
-					rate: r.correctionRate ?? (r.sessionsAnalyzed > 0 ? r.correctionsFound / r.sessionsAnalyzed : 0),
+					rate: r.correctionRate!,
 					corrections: r.correctionsFound,
 					sessions: r.sessionsAnalyzed,
 				}));
@@ -303,9 +306,9 @@ export default function (pi: ExtensionAPI) {
 
 					output.push("");
 					if (delta < -0.01) {
-						output.push(`Trend: \u2193 improving (${pct}% fewer corrections per session)`);
+						output.push(`Descriptive trend: ${pct}% fewer corrections per session; improvement not established.`);
 					} else if (delta > 0.01) {
-						output.push(`Trend: \u2191 worsening (${pct}% more corrections per session)`);
+						output.push(`Descriptive trend: ${pct}% more corrections per session; deterioration not established.`);
 					} else {
 						output.push(`Trend: \u2194 flat`);
 					}
@@ -313,14 +316,14 @@ export default function (pi: ExtensionAPI) {
 
 				// --- Rule Recidivism ---
 				output.push("");
-				output.push("### Rule Recidivism (sections edited multiple times)");
+				output.push("### Rule churn (not a measure of behavioral recurrence)");
 				output.push("");
 
 				const sectionCounts = new Map<string, { count: number; types: string[]; reasons: string[]; dates: string[] }>();
 
 				for (const run of runs) {
-					if (!run.edits) continue;
-					for (const edit of run.edits) {
+					if (run.status !== "success" || !run.proposals) continue;
+					for (const edit of run.proposals.filter((proposal) => proposal.status === "applied")) {
 						const key = edit.section.toLowerCase().trim();
 						const existing = sectionCounts.get(key) ?? { count: 0, types: [], reasons: [], dates: [] };
 						existing.count++;
@@ -339,7 +342,7 @@ export default function (pi: ExtensionAPI) {
 					const resolved = sorted.filter(([, v]) => v.count === 1);
 
 					if (recidivists.length > 0) {
-						output.push("**Recurring (not sticking):**");
+						output.push("**Repeatedly edited sections:**");
 						for (const [section, data] of recidivists) {
 							const strengthened = data.types.filter((t) => t === "strengthen").length;
 							const added = data.types.filter((t) => t === "add").length;
@@ -351,12 +354,12 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 					} else {
-						output.push("**No recurring violations.** All rules stuck after first edit.");
+						output.push("No repeated section edits recorded. Behavioral outcomes remain unverified.");
 					}
 
 					if (resolved.length > 0) {
 						output.push("");
-						output.push(`**Resolved (edited once, not repeated):** ${resolved.length} rule(s)`);
+						output.push(`**Edited once (not evidence of resolution):** ${resolved.length} section(s)`);
 						for (const [section] of resolved.slice(0, 5)) {
 							output.push(`- ${section}`);
 						}
@@ -419,7 +422,7 @@ export default function (pi: ExtensionAPI) {
 				const targetPath = resolvePath(target.path);
 				const coveredDates = new Set(
 					history
-						.filter((r) => r.targetPath === targetPath)
+						.filter((r) => r.targetPath === targetPath && r.status === "success")
 						.map((r) => r.sourceDate ?? (r as any).date)
 						.filter(Boolean),
 				);
@@ -508,7 +511,8 @@ export default function (pi: ExtensionAPI) {
 					if (run) {
 						updatedHistory.push(run);
 						saveHistory(updatedHistory);
-						completed++;
+						if (run.status === "success" || run.status === "no_data") completed++;
+						else failed++;
 					} else {
 						failed++;
 					}

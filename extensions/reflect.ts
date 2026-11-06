@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
+import { createHash, randomUUID } from "node:crypto";
 
 // --- Paths ---
 
@@ -44,6 +45,7 @@ export interface ReflectTarget {
 	path: string;
 	schedule: "daily" | "manual";
 	model: string;
+	reasoning?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 	lookbackDays: number;
 	maxSessionBytes: number;
 	backupDir: string;
@@ -69,7 +71,47 @@ export interface EditRecord {
 	reason: string;
 }
 
+export interface Evidence {
+	id: string;
+	sessionId: string;
+	messageId: string;
+	timestamp: string;
+	quote: string;
+	isNew: boolean;
+}
+
+export interface Proposal {
+	type: AnalysisEdit["type"];
+	section: string;
+	oldText: string;
+	newText: string;
+	reason: string;
+	evidenceIds: string[];
+	status: "applied" | "skipped" | "approval_required" | "proposed";
+	approvalReason?: string;
+	ruleId: string;
+}
+
 export interface ReflectRun {
+	status?: "success" | "partial" | "failed" | "no_data";
+	invocationId?: string;
+	sessionsExtracted?: number;
+	successfulBatches?: number;
+	failedBatches?: number;
+	proposals?: Proposal[];
+	evidence?: Evidence[];
+	durationMs?: number;
+	dryRun?: boolean;
+	backupPath?: string;
+	targetBeforeHash?: string;
+	targetAfterHash?: string;
+	model?: string;
+	reasoning?: ReflectTarget["reasoning"];
+	truncatedSessions?: number;
+	failureReasons?: string[];
+	usage?: { input: number; output: number; cost: number };
+	proposedCount?: number;
+	skippedCount?: number;
 	timestamp: string;
 	targetPath: string;
 	sessionsAnalyzed: number;
@@ -77,7 +119,7 @@ export interface ReflectRun {
 	editsApplied: number;
 	summary: string;
 	diffLines: number;
-	correctionRate: number;
+	correctionRate: number | null;
 	edits?: EditRecord[];
 	sourceDate?: string;
 	date?: string; // legacy field from bash-script/batch runs
@@ -89,6 +131,9 @@ export interface SessionExchange {
 	role: "user" | "assistant";
 	text: string | null;
 	thinking: string | null;
+	messageId?: string;
+	timestamp?: string;
+	sessionId?: string;
 }
 
 export interface SessionData {
@@ -98,6 +143,7 @@ export interface SessionData {
 	size: number;
 	project: string;
 	time: string;
+	userMessages?: SessionExchange[];
 }
 
 export interface TranscriptResult {
@@ -123,6 +169,7 @@ export interface AnalysisEdit {
 	/** For "merge": array of exact text strings to remove (they're consolidated into new_text) */
 	merge_sources?: string[];
 	reason?: string;
+	evidence?: { sessionId: string; messageId: string; timestamp: string; quote: string }[];
 }
 
 export interface ReflectionOptions {
@@ -194,8 +241,7 @@ export function loadHistory(): ReflectRun[] {
 }
 
 export function saveHistory(runs: ReflectRun[]): void {
-	const trimmed = runs.slice(-100);
-	fs.writeFileSync(HISTORY_FILE, JSON.stringify(trimmed, null, 2), "utf-8");
+	fs.writeFileSync(HISTORY_FILE, JSON.stringify(runs, null, 2), "utf-8");
 }
 
 // --- Helpers ---
@@ -242,6 +288,7 @@ export function projectNameFromDir(dirname: string): string {
 
 export async function extractTranscript(filepath: string): Promise<SessionExchange[]> {
 	const exchanges: SessionExchange[] = [];
+	let sessionId = createHash("sha256").update(path.resolve(filepath)).digest("hex").slice(0, 20);
 	try {
 		const rl = createInterface({ input: createReadStream(filepath), crlfDelay: Infinity });
 		for await (const line of rl) {
@@ -252,6 +299,7 @@ export async function extractTranscript(filepath: string): Promise<SessionExchan
 				continue;
 			}
 
+			if (entry.type === "session" && typeof entry.id === "string" && entry.id) { sessionId = entry.id; continue; }
 			if (entry.type !== "message") continue;
 			const msg = entry.message;
 			if (!msg) continue;
@@ -279,6 +327,9 @@ export async function extractTranscript(filepath: string): Promise<SessionExchan
 				role,
 				text: textParts.length > 0 ? textParts.join("\n") : null,
 				thinking: thinkingParts.length > 0 ? thinkingParts.join("\n") : null,
+				messageId: typeof entry.id === "string" ? entry.id : undefined,
+				timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
+				sessionId,
 			});
 		}
 	} catch {
@@ -294,7 +345,7 @@ export function formatSessionTranscript(exchanges: SessionExchange[], sessionId:
 
 	for (const ex of exchanges) {
 		if (ex.role === "user") {
-			lines.push(`**USER:** ${ex.text}`);
+			lines.push(`**USER** [sessionId=${ex.sessionId ?? "unknown"} messageId=${ex.messageId ?? "unknown"} timestamp=${ex.timestamp ?? "unknown"}]: ${ex.text}`);
 			lines.push("");
 		} else if (ex.role === "assistant") {
 			if (ex.thinking) {
@@ -313,35 +364,6 @@ export function formatSessionTranscript(exchanges: SessionExchange[], sessionId:
 
 // --- Shared session scanning logic ---
 
-function scanSessionFiles(
-	effectiveSessionsDir: string,
-	targetDates: string[],
-	maxBytes: number,
-): { allSessions: SessionData[]; totalScanned: number } {
-	// Include "next day" for UTC/local timezone overlap
-	const nextDates = targetDates.map((d) => {
-		const next = new Date(d + "T00:00:00Z");
-		next.setDate(next.getDate() + 1);
-		return next.toISOString().slice(0, 10);
-	});
-	const allDates = new Set([...targetDates, ...nextDates]);
-
-	const sessionDirs: string[] = [];
-	try {
-		for (const dir of fs.readdirSync(effectiveSessionsDir)) {
-			if (dir.includes("var-folders")) continue;
-			const fullDir = path.join(effectiveSessionsDir, dir);
-			if (fs.statSync(fullDir).isDirectory()) {
-				sessionDirs.push(fullDir);
-			}
-		}
-	} catch {
-		return { allSessions: [], totalScanned: 0 };
-	}
-
-	return { allSessions: [], totalScanned: 0, _sessionDirs: sessionDirs, _allDates: allDates, _targetDates: new Set(targetDates) } as any;
-}
-
 async function collectSessionsForDates(
 	targetDates: string[],
 	maxBytes: number,
@@ -349,13 +371,8 @@ async function collectSessionsForDates(
 ): Promise<TranscriptResult> {
 	const effectiveSessionsDir = sessionsDir ?? SESSIONS_DIR;
 
-	const nextDates = targetDates.map((d) => {
-		const next = new Date(d + "T00:00:00Z");
-		next.setDate(next.getDate() + 1);
-		return next.toISOString().slice(0, 10);
-	});
-	const allDates = new Set([...targetDates, ...nextDates]);
 	const targetDateSet = new Set(targetDates);
+	const earliestMtime = new Date(`${targetDates.slice().sort()[0]}T00:00:00Z`).getTime() - 86_400_000;
 
 	const sessionDirs: string[] = [];
 	try {
@@ -383,24 +400,19 @@ async function collectSessionsForDates(
 		}
 
 		for (const file of files) {
-			const fileDate = file.slice(0, 10);
-			if (!allDates.has(fileDate)) continue;
-
-			if (!targetDateSet.has(fileDate)) {
-				try {
-					const hour = parseInt(file.slice(11, 13));
-					if (hour >= 8) continue;
-				} catch {
-					continue;
-				}
-			}
-
-			totalScanned++;
 			const filepath = path.join(dir, file);
-			const exchanges = await extractTranscript(filepath);
+			try { if (fs.statSync(filepath).mtimeMs < earliestMtime) continue; } catch { continue; }
+			totalScanned++;
+			const allExchanges = await extractTranscript(filepath);
+			const exchanges = allExchanges.filter((e) => {
+				if (!e.timestamp) return false;
+				const date = new Date(e.timestamp);
+				if (!Number.isFinite(date.getTime())) return false;
+				const localDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+				return targetDateSet.has(localDate);
+			});
 			const userCount = exchanges.filter((e) => e.role === "user").length;
-
-			if (userCount < 1 || exchanges.length < 3) continue;
+			if (userCount < 1) continue;
 
 			const sessionTime = file.slice(0, 19).replace("T", " ");
 			const transcript = formatSessionTranscript(exchanges, sessionTime, project);
@@ -412,6 +424,7 @@ async function collectSessionsForDates(
 				size: transcript.length,
 				project,
 				time: sessionTime,
+				userMessages: exchanges.filter((e) => e.role === "user"),
 			});
 		}
 	}
@@ -660,19 +673,9 @@ export function getAvailableSessionDates(): string[] {
 
 export function buildReflectionPrompt(targetPath: string, targetContent: string, transcripts: string): string {
 	const fileName = path.basename(targetPath);
-	const charCount = targetContent.length;
-	const lineCount = targetContent.split("\n").length;
 	return `You are reviewing recent agent session transcripts to improve ${fileName}.
 
-## CRITICAL: Conciseness
-
-The target file is ${lineCount} lines / ${charCount} chars. Your #1 job is to keep it CONCISE.
-- Every rule should be 1-2 sentences max. If a rule is longer, condense it.
-- Remove session counts, escalating repetition tallies, and "this happened N times" histories — the rule itself is what matters, not how many times it was violated.
-- Remove verbose examples when the rule is self-explanatory.
-- Merge rules that say the same thing in different words.
-- Remove rules that are subsumed by other, better-worded rules.
-- A good rule file is SHORT and scannable. Walls of text get ignored by agents.
+Preserve existing rules and examples. Propose changes only for verified new corrections.
 
 ## Input
 
@@ -692,18 +695,17 @@ Read the transcripts for genuine corrections — user redirecting the agent, exp
 
 For each correction: what the agent did wrong, what the user wanted, and which rule (if any) already covers it.
 
-## Step 2: Propose Edits (prioritize conciseness)
+## Step 2: Propose evidence-backed edits
 
 Four edit types available:
-1. **strengthen**: Tighten an existing rule's wording (make it clearer/shorter, not longer).
-2. **add**: Add a new rule for a pattern with 2+ occurrences. Keep it to 1-2 sentences.
-3. **remove**: Delete a rule that is redundant (covered by another rule), obsolete, or overly verbose noise.
-4. **merge**: Consolidate 2+ rules that overlap into one concise rule.
+1. **strengthen**: Improve an existing rule only when new correction evidence supports the change.
+2. **add**: Add a new rule for a pattern supported by corrections from at least two distinct sessions.
+3. **remove**: Propose deletion only when supported by new correction evidence; approval is required.
+4. **merge**: Propose consolidation only when supported by new correction evidence; approval is required.
 
 Guidelines:
-- Prefer strengthen/merge/remove over add. The file should get SHORTER or stay the same size, not grow.
-- When strengthening, make the rule SHORTER and CLEARER — don't add history or examples unless essential.
-- Strip "This happened in N sessions", "RECURRING", session dates, escalating violation counts. The rule text is enough.
+- Do not propose cosmetic edits without new evidence. Preserve existing safety clauses exactly.
+- Every proposal must cite exact user correction quotes with sessionId, messageId and timestamp from the transcript.
 - Don't reorganize or restructure the file. Minimal, targeted edits only.
 - Sections whose heading contains "DO NOT EDIT" are maintained by the user and are READ-ONLY. Never propose strengthen/remove/merge/add edits whose anchors fall inside them, never shorten or move their examples, and do not duplicate their rules elsewhere. Edits touching them are rejected automatically.
 - Copy anchors character-for-character from the target file. Do not abbreviate, paraphrase, truncate, normalize punctuation, or use ellipses in old_text, after_text, or merge_sources.
@@ -713,7 +715,7 @@ Guidelines:
 
 IMPORTANT: Your ENTIRE response must be a single JSON object. No markdown, no preamble.
 
-For "strengthen": old_text = COMPLETE bullet/rule copied exactly. new_text = shorter/clearer replacement.
+For "strengthen": old_text = COMPLETE bullet/rule copied exactly. new_text = evidence-backed replacement.
 For "add": after_text = COMPLETE bullet/line copied exactly. new_text = concise new bullet (1-2 sentences).
 For "remove": old_text = COMPLETE bullet/rule to delete. new_text = "" (empty string).
 For "merge": merge_sources = array of COMPLETE bullets to consolidate. new_text = single concise replacement. The merged text replaces the first source; others are removed.
@@ -729,7 +731,8 @@ For "merge": merge_sources = array of COMPLETE bullets to consolidate. new_text 
       "new_text": "replacement/new text, or empty string for remove",
       "after_text": "insertion point (add only) or null",
       "merge_sources": ["exact text 1", "exact text 2"] or null (merge only),
-      "reason": "brief reason for this edit"
+      "reason": "brief reason for this edit",
+      "evidence": [{"sessionId":"exact sessionId", "messageId":"exact messageId", "timestamp":"exact timestamp", "quote":"exact USER correction quote"}]
     }
   ],
   "patterns_not_added": [
@@ -1018,6 +1021,7 @@ interface AnalysisResult {
 	sessionsWithCorrections: number;
 	summary: string;
 	patternsNotAdded?: any[];
+	usage?: { input: number; output: number; cost: number };
 }
 
 /** Run a single LLM analysis call on one batch of transcripts */
@@ -1042,6 +1046,9 @@ export function buildReflectAnalysisTool() {
 							after_text: { type: "string", description: "Exact insertion point for add; omit otherwise" },
 							merge_sources: { type: "array", items: { type: "string" }, description: "Exact source texts for merge; omit otherwise" },
 							reason: { type: "string", description: "Brief reason for this edit" },
+							evidence: { type: "array", items: { type: "object", properties: {
+								sessionId: { type: "string" }, messageId: { type: "string" }, timestamp: { type: "string" }, quote: { type: "string" },
+							}, required: ["sessionId", "messageId", "timestamp", "quote"] } },
 						},
 						required: ["type", "new_text"],
 					},
@@ -1085,7 +1092,7 @@ async function analyzeTranscriptBatch(
 	const reflectAnalysisTool = buildReflectAnalysisTool();
 
 	const response = await completeFn(model, {
-		systemPrompt: "You are a behavioral analysis tool that prioritizes CONCISENESS. Your goal is to keep the target file short and scannable — prefer merging, removing, and tightening rules over adding new ones. The file should get shorter or stay the same size, not grow. Analyze the session transcripts and call the submit_analysis tool with your results. Always call the tool — never respond with plain text.",
+		systemPrompt: "Analyze user corrections, preserve safety rules, and propose only evidence-backed improvements. Cite exact USER messages. Call the submit_analysis tool.",
 		messages: [
 			{
 				role: "user" as const,
@@ -1094,10 +1101,11 @@ async function analyzeTranscriptBatch(
 			},
 		],
 		tools: [reflectAnalysisTool],
-	}, { apiKey, headers, maxTokens: 16384 });
+	}, { apiKey, headers, maxTokens: 16384, reasoning: target.reasoning });
 
-	if (response.stopReason === "error") {
-		notify(`LLM error: ${response.errorMessage ?? 'unknown'}`, "error");
+	if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") {
+		const category = /(?:unsupported|not supported|invalid).{0,60}(?:reasoning|thinking)|(?:reasoning|thinking).{0,60}(?:unsupported|not supported|invalid)/i.test(String(response.errorMessage ?? "")) ? "unsupported reasoning" : "provider failure";
+		notify(`LLM analysis failed (${category}; stopReason=${response.stopReason}).`, "error");
 		return null;
 	}
 
@@ -1115,17 +1123,30 @@ async function analyzeTranscriptBatch(
 			const jsonStr = responseText.replace(/^```json?\s*\n?/m, "").replace(/\n?```\s*$/m, "");
 			analysis = JSON.parse(jsonStr);
 		} catch {
-			notify(`Failed to parse LLM response as JSON. Raw response:\n${responseText.slice(0, 500)}`, "error");
+			notify("Failed to parse LLM analysis response.", "error");
 			return null;
 		}
 	}
 
+	const validCount = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+	const validEdit = (edit: any) => edit && ["add", "strengthen", "remove", "merge"].includes(edit.type) && typeof edit.new_text === "string"
+		&& (edit.section == null || typeof edit.section === "string") && (edit.reason == null || typeof edit.reason === "string")
+		&& (edit.type !== "add" || typeof edit.after_text === "string")
+		&& (!["strengthen", "remove"].includes(edit.type) || typeof edit.old_text === "string")
+		&& (edit.type !== "merge" || (Array.isArray(edit.merge_sources) && edit.merge_sources.every((s: unknown) => typeof s === "string")))
+		&& Array.isArray(edit.evidence) && edit.evidence.every((e: any) => e && [e.sessionId, e.messageId, e.timestamp, e.quote].every((v) => typeof v === "string"));
+	if (!analysis || !Array.isArray(analysis.edits) || !analysis.edits.every(validEdit) || !validCount(analysis.corrections_found) || !validCount(analysis.sessions_with_corrections) || typeof analysis.summary !== "string") {
+		notify("LLM analysis response is incomplete.", "error");
+		return null;
+	}
 	return {
-		edits: analysis.edits ?? [],
+		edits: analysis.edits,
 		correctionsFound: analysis.corrections_found ?? 0,
 		sessionsWithCorrections: analysis.sessions_with_corrections ?? 0,
 		summary: analysis.summary ?? "",
 		patternsNotAdded: analysis.patterns_not_added,
+		usage: typeof response.usage?.input === "number" && typeof response.usage?.output === "number" && typeof response.usage?.cost?.total === "number"
+			? { input: response.usage.input, output: response.usage.output, cost: response.usage.cost.total } : undefined,
 	};
 }
 
@@ -1152,6 +1173,7 @@ export async function resolveModelAuth(
 export interface RunReflectionDeps {
 	completeSimple: (model: any, request: any, options: any) => Promise<any>;
 	getModel: (provider: string, modelId: string) => any;
+	loadHistoryFn?: () => ReflectRun[];
 	collectTranscriptsFn?: (lookbackDays: number, maxBytes: number) => Promise<TranscriptResult>;
 	collectTranscriptsFromCommandFn?: (command: string, lookbackDays: number, maxBytes: number) => Promise<TranscriptResult>;
 }
@@ -1162,370 +1184,145 @@ export async function runReflection(
 	notify: NotifyFn,
 	deps?: RunReflectionDeps,
 	options?: ReflectionOptions,
-): Promise<ReflectRun | null> {
+): Promise<ReflectRun> {
+	const started = Date.now();
 	const targetPath = resolvePath(target.path);
-
-	if (!fs.existsSync(targetPath)) {
-		notify(`Target file not found: ${targetPath}`, "error");
-		return null;
-	}
-
-	const targetContent = fs.readFileSync(targetPath, "utf-8");
-	if (targetContent.length < 100) {
-		notify(`Target file too small (${targetContent.length} bytes): ${targetPath}`, "error");
-		return null;
-	}
-	const preexistingTargetChanges = hasUncommittedChanges(targetPath);
-	if (preexistingTargetChanges) {
-		notify(`${path.basename(targetPath)} has uncommitted manual edits; they will be committed separately before the reflect commit.`, "info");
-	}
-
-	// Collect transcripts — supports new `transcripts` array (ContextSource[]) or legacy `transcriptSource`
-	let transcripts: string;
-	let sessionCount = 0;
-	let includedCount = 0;
-	let allSessions: SessionData[] | undefined;
-
-	if (options?.transcriptsOverride) {
-		({ transcripts, sessionCount, includedCount } = options.transcriptsOverride);
-		allSessions = options.transcriptsOverride.sessions;
-	} else if (target.transcripts && target.transcripts.length > 0) {
-		// New array-based transcript sources
-		notify(`Extracting transcripts from ${target.transcripts.length} source(s) (last ${target.lookbackDays} day(s))...`, "info");
-		transcripts = await collectContext(target.transcripts, target.lookbackDays);
-		// Estimate session count from section headers
-		const headerMatches = transcripts.match(/^###\s/gm);
-		sessionCount = headerMatches?.length ?? 1;
-		includedCount = sessionCount;
-	} else if (target.transcriptSource?.type === "command" && target.transcriptSource.command) {
-		notify(`Extracting transcripts (last ${target.lookbackDays} day(s))...`, "info");
-		const fn = deps?.collectTranscriptsFromCommandFn ?? collectTranscriptsFromCommand;
-		const result = await fn(
-			target.transcriptSource.command,
-			target.lookbackDays,
-			target.maxSessionBytes,
-		);
-		({ transcripts, sessionCount, includedCount } = result);
-		allSessions = result.sessions;
-	} else {
-		notify(`Extracting transcripts (last ${target.lookbackDays} day(s))...`, "info");
-		const fn = deps?.collectTranscriptsFn ?? collectTranscripts;
-		const result = await fn(
-			target.lookbackDays,
-			target.maxSessionBytes,
-		);
-		({ transcripts, sessionCount, includedCount } = result);
-		allSessions = result.sessions;
-	}
-
-	if (!transcripts || includedCount === 0) {
-		notify(`No substantive sessions found (${sessionCount} scanned). Nothing to reflect on.`, "info");
-		return null;
-	}
-
-	// Use total session count from allSessions if available (includes sessions that didn't fit the budget)
-	const totalSessionCount = allSessions ? allSessions.length : includedCount;
-	const totalBytes = allSessions ? allSessions.reduce((sum, s) => sum + s.size, 0) : transcripts.length;
-	notify(`Extracted ${totalSessionCount} sessions (${sessionCount} scanned, ${(totalBytes / 1024).toFixed(0)}KB)`, "info");
-
-	// Dedup: skip if we already reflected on this target+sourceDate
-	if (!options?.sourceDateOverride) {
-		const sourceDate = new Date();
-		sourceDate.setDate(sourceDate.getDate() - target.lookbackDays);
-		const sourceDateStr = sourceDate.toISOString().slice(0, 10);
-		const history = loadHistory();
-		const alreadyRan = history.some(
-			(r) => r.targetPath === targetPath && r.sourceDate === sourceDateStr,
-		);
-		if (alreadyRan) {
-			notify(`Already reflected on ${sourceDateStr} for this target — skipping`, "info");
-			return null;
-		}
-	}
-
-	// Resolve model — prefer current session model over target.model config
-	let model: any;
-	let apiKey: string | undefined;
-	let headers: Record<string, string> | undefined;
-	let modelLabel: string;
-
-	if (options?.currentModel && options?.currentModelApiKey) {
-		model = options.currentModel;
-		apiKey = options.currentModelApiKey;
-		headers = options.currentModelHeaders;
-		modelLabel = `${model.provider}/${model.id}`;
-	} else {
-		const getModelFn = deps?.getModel ?? (await import("@earendil-works/pi-ai/compat")).getModel;
-		const [provider, modelId] = target.model.split("/", 2);
-		model = getModelFn(provider as any, modelId as any);
-
-		if (!model) {
-			model = modelRegistry?.find(provider, modelId);
-		}
-		if (!model) {
-			notify(`Model not found: ${target.model}`, "error");
-			return null;
-		}
-
-		const auth = await resolveModelAuth(modelRegistry, model);
-		if (!auth.ok) {
-			notify(`No API key for model: ${target.model}${auth?.error ? ` (${auth.error})` : ''}`, "error");
-			return null;
-		}
-		apiKey = auth.apiKey;
-		headers = auth.headers;
-		modelLabel = target.model;
-	}
-
-	// Collect additional context
-	let context = "";
-	if (target.context && target.context.length > 0) {
-		notify(`Collecting context from ${target.context.length} source(s)...`, "info");
-		context = await collectContext(target.context, target.lookbackDays);
-		if (context) {
-			notify(`Collected ${(context.length / 1024).toFixed(0)}KB of additional context`, "info");
-		}
-	}
-
-	// Build batches and call LLM
-	const completeFn = deps?.completeSimple ?? (await import("@earendil-works/pi-ai/compat")).completeSimple;
-
-	// Determine if we need multiple batches
-	// Reserve space for target file, system prompt, tool schema, and context
-	const overhead = targetContent.length + (context?.length ?? 0) + 20_000; // 20KB for prompt/tool schema
-	const batchBudget = Math.max(target.maxSessionBytes - overhead, 100_000); // at least 100KB per batch
-	const needsBatching = allSessions && allSessions.length > 0 && totalBytes > batchBudget;
-	let allEdits: AnalysisEdit[] = [];
-	let totalCorrectionsFound = 0;
-	let allSummaries: string[] = [];
-
-	if (needsBatching) {
-		const batches = buildTranscriptBatches(allSessions!, batchBudget);
-		notify(`Sessions exceed context budget — splitting into ${batches.length} batches`, "info");
-
-		for (let i = 0; i < batches.length; i++) {
-			const batchTranscripts = formatBatchTranscripts(batches[i], i, batches.length, totalSessionCount);
-			// Re-read target content for each batch so later batches see earlier edits
-			const currentContent = i === 0 ? targetContent : fs.readFileSync(targetPath, "utf-8");
-			notify(`Analyzing batch ${i + 1}/${batches.length} (${batches[i].length} sessions, ${(batchTranscripts.length / 1024).toFixed(0)}KB) with ${modelLabel}...`, "info");
-
-			let result = await analyzeTranscriptBatch(
-				target, targetPath, currentContent, batchTranscripts, context,
-				model, apiKey!, headers, modelLabel, notify, completeFn,
-			);
-
-			if (!result) continue;
-
-			const firstAttempt = result.edits.length > 0 ? applyEdits(currentContent, result.edits) : undefined;
-			if (firstAttempt && firstAttempt.applied === 0) {
-				notify(`Batch ${i + 1}: retrying ${result.edits.length} edit(s) with exact target-file anchors.`, "warning");
-				const retry = await analyzeTranscriptBatch(
-					target, targetPath, currentContent, batchTranscripts, context,
-					model, apiKey!, headers, modelLabel, notify, completeFn, firstAttempt.skipped,
-				);
-				if (retry) result = retry;
-			}
-
-			allEdits.push(...result.edits);
-			totalCorrectionsFound += result.correctionsFound;
-			if (result.summary) allSummaries.push(result.summary);
-
-			// Apply this batch's edits immediately so the next batch sees the updated file
-			if (result.edits.length > 0) {
-				const currentForApply = fs.readFileSync(targetPath, "utf-8");
-				const { result: updated, applied } = applyEdits(currentForApply, result.edits);
-				if (applied > 0) {
-					// Backup before first edit
-					if (i === 0) {
-						const bkDir = resolvePath(target.backupDir);
-						fs.mkdirSync(bkDir, { recursive: true });
-						const bkPath = path.join(bkDir, `${path.basename(targetPath, ".md")}_${formatTimestamp()}.md`);
-						fs.copyFileSync(targetPath, bkPath);
-					}
-					fs.writeFileSync(targetPath, updated, "utf-8");
-					notify(`Batch ${i + 1}: applied ${applied} edit(s)`, "info");
-				}
-			}
-		}
-	} else {
-		notify(`Analyzing with ${modelLabel}...`, "info");
-		let result = await analyzeTranscriptBatch(
-			target, targetPath, targetContent, transcripts, context,
-			model, apiKey!, headers, modelLabel, notify, completeFn,
-		);
-		if (!result) return null;
-
-		// A model can still paraphrase an anchor despite the prompt. Retry once with
-		// the rejected anchors and the original target instead of silently losing a
-		// valid reflection opportunity. applyEdits remains exact and safe.
-		const firstAttempt = result.edits.length > 0 ? applyEdits(targetContent, result.edits) : undefined;
-		if (firstAttempt && firstAttempt.applied === 0) {
-			notify(`Retrying ${result.edits.length} edit(s) with exact target-file anchors.`, "warning");
-			const retry = await analyzeTranscriptBatch(
-				target, targetPath, targetContent, transcripts, context,
-				model, apiKey!, headers, modelLabel, notify, completeFn, firstAttempt.skipped,
-			);
-			if (retry) result = retry;
-		}
-		allEdits = result.edits;
-		totalCorrectionsFound = result.correctionsFound;
-		if (result.summary) allSummaries.push(result.summary);
-	}
-
-	const edits = allEdits;
-	const correctionsFound = totalCorrectionsFound;
-	const correctionRate = totalSessionCount > 0 ? correctionsFound / totalSessionCount : 0;
-
-	// sourceDate = the date of sessions being analyzed, not when reflect ran
-	let sourceDateStr: string;
-	if (options?.sourceDateOverride) {
-		sourceDateStr = options.sourceDateOverride;
-	} else {
-		const sourceDate = new Date();
-		sourceDate.setDate(sourceDate.getDate() - target.lookbackDays);
-		sourceDateStr = sourceDate.toISOString().slice(0, 10);
-	}
-
-	const combinedSummary = allSummaries.join(" ") || `${edits.length} edits from ${totalSessionCount} sessions.`;
-
-	if (edits.length === 0) {
-		notify(`No edits needed. ${combinedSummary}`, "info");
-		return {
-			timestamp: new Date().toISOString(),
-			targetPath,
-			sessionsAnalyzed: totalSessionCount,
-			correctionsFound,
-			editsApplied: 0,
-			summary: combinedSummary,
-			diffLines: 0,
-			correctionRate,
-			edits: [],
-			sourceDate: sourceDateStr,
-			fileSize: computeFileMetrics(fs.readFileSync(targetPath, "utf-8")),
-		};
-	}
-
-	// In dryRun mode, skip applying edits — just record the analysis
-	if (options?.dryRun) {
-		const editRecords: EditRecord[] = edits
-			.filter((e: any) => e.section && e.reason)
-			.map((e: any) => ({
-				type: e.type ?? "add",
-				section: e.section,
-				reason: e.reason,
-			}));
-
-		notify(`[dry run] ${combinedSummary}`, "info");
-
-		return {
-			timestamp: new Date().toISOString(),
-			targetPath,
-			sessionsAnalyzed: totalSessionCount,
-			correctionsFound,
-			editsApplied: 0,
-			summary: combinedSummary,
-			diffLines: 0,
-			correctionRate,
-			edits: editRecords,
-			sourceDate: sourceDateStr,
-			fileSize: computeFileMetrics(fs.readFileSync(targetPath, "utf-8")),
-		};
-	}
-
-	// Apply edits
-	const backupDir = resolvePath(target.backupDir);
-	let totalApplied = 0;
-
-	if (needsBatching) {
-		// Batched: edits were already applied inline in the loop above.
-		// Count total applied from the diff.
-		const finalContent = fs.readFileSync(targetPath, "utf-8");
-		const origLines = targetContent.split("\n");
-		const finalLines = finalContent.split("\n");
-		for (let i = 0; i < Math.max(origLines.length, finalLines.length); i++) {
-			if (origLines[i] !== finalLines[i]) totalApplied++;
-		}
-		// Use edit count as applied since we tracked them per-batch
-		totalApplied = edits.length; // best estimate — individual batch applied counts were logged
-	} else {
-		// Single batch — backup and apply
-		fs.mkdirSync(backupDir, { recursive: true });
-		const backupPath = path.join(backupDir, `${path.basename(targetPath, ".md")}_${formatTimestamp()}.md`);
-		fs.copyFileSync(targetPath, backupPath);
-
-		const { result, applied, skipped } = applyEdits(targetContent, edits);
-
-		if (applied === 0) {
-			notify(`All ${edits.length} edits failed to apply. Skipped: ${skipped.join("; ")}`, "warning");
-			try { fs.unlinkSync(backupPath); } catch {}
-			return null;
-		}
-
-		if (result.length < targetContent.length * 0.5) {
-			notify(`Result is suspiciously small (${result.length} vs ${targetContent.length} bytes). Aborting.`, "error");
-			return null;
-		}
-
-		fs.writeFileSync(targetPath, result, "utf-8");
-		totalApplied = applied;
-
-		if (skipped.length > 0) {
-			notify(`Applied ${applied}/${edits.length} edits (${skipped.length} skipped). Backup: ${backupPath}`, "warning");
-		} else {
-			notify(`Applied ${applied} edit(s). Backup: ${backupPath}`, "info");
-		}
-	}
-
-	// Compute final diff
-	const finalContent = fs.readFileSync(targetPath, "utf-8");
-	const originalLines = targetContent.split("\n");
-	const resultLines = finalContent.split("\n");
-	let diffLines = 0;
-	const maxLen = Math.max(originalLines.length, resultLines.length);
-	for (let i = 0; i < maxLen; i++) {
-		if (originalLines[i] !== resultLines[i]) diffLines++;
-	}
-
-	notify(combinedSummary, "info");
-
-	// Git commit — only the target file, so unrelated work in the repo is untouched.
-	try {
-		const realPath = fs.realpathSync(targetPath);
-		const repoDir = path.dirname(realPath);
-		if (fs.existsSync(path.join(repoDir, ".git"))) {
-			const rel = path.basename(realPath);
-			if (preexistingTargetChanges) {
-				// Manual edits were sitting uncommitted before reflection ran. Commit them
-				// on their own so they are visible in history instead of being folded into
-				// the reflect commit.
-				fs.writeFileSync(targetPath, targetContent, "utf-8");
-				execFileSync("git", ["add", "--", rel], { cwd: repoDir, stdio: "ignore", timeout: 5000 });
-				execFileSync("git", ["commit", "-m", `reflect: preserve manual edits to ${rel} made before reflection`, "--no-verify"], { cwd: repoDir, stdio: "ignore", timeout: 5000 });
-				fs.writeFileSync(targetPath, finalContent, "utf-8");
-			}
-			execFileSync("git", ["add", "--", rel], { cwd: repoDir, stdio: "ignore", timeout: 5000 });
-			execFileSync("git", ["commit", "-m", `reflect: ${rel} — ${totalApplied} edits from ${totalSessionCount} sessions`, "--no-verify"], { cwd: repoDir, stdio: "ignore", timeout: 5000 });
-			notify(`Committed ${rel} to ${path.basename(repoDir)}`, "info");
-		}
-	} catch {}
-
-	const editRecords: EditRecord[] = edits
-		.filter((e: any) => e.section && e.reason)
-		.map((e: any) => ({ type: e.type ?? "add", section: e.section, reason: e.reason }));
-
-	return {
-		timestamp: new Date().toISOString(),
-		targetPath,
-		sessionsAnalyzed: totalSessionCount,
-		correctionsFound,
-		editsApplied: totalApplied,
-		summary: combinedSummary,
-		diffLines,
-		correctionRate,
-		edits: editRecords,
-		sourceDate: sourceDateStr,
-		fileSize: computeFileMetrics(fs.readFileSync(targetPath, "utf-8")),
+	const run: ReflectRun = {
+		timestamp: new Date(started).toISOString(), targetPath, status: "failed", dryRun: !!options?.dryRun, model: target.model, reasoning: target.reasoning, failureReasons: [],
+		sourceDate: options?.sourceDateOverride ?? new Date(started - target.lookbackDays * 86_400_000).toISOString().slice(0, 10),
+		sessionsExtracted: 0, sessionsAnalyzed: 0, successfulBatches: 0, failedBatches: 0,
+		correctionsFound: 0, editsApplied: 0, proposedCount: 0, skippedCount: 0,
+		summary: "Reflection failed.", diffLines: 0, correctionRate: null, proposals: [], evidence: [],
 	};
+	const finish = (status: NonNullable<ReflectRun["status"]>, summary: string): ReflectRun => {
+		run.status = status;
+		if (status === "failed" || status === "partial") notify(summary.slice(0, 200), "error");
+		run.summary = summary.slice(0, 1000);
+		run.durationMs = Date.now() - started;
+		if (status !== "success") run.correctionRate = null;
+		return run;
+	};
+	try {
+		if (!fs.existsSync(targetPath)) return finish("failed", "Target file not found.");
+		const original = fs.readFileSync(targetPath, "utf-8");
+		run.targetBeforeHash = createHash("sha256").update(original).digest("hex");
+		if (original.length < 100) return finish("failed", "Target file too small.");
+		let collected: TranscriptResult;
+		if (options?.transcriptsOverride) collected = options.transcriptsOverride;
+		else if (target.transcripts?.length) {
+			const transcripts = await collectContext(target.transcripts, target.lookbackDays);
+			collected = { transcripts, sessionCount: transcripts ? 1 : 0, includedCount: transcripts ? 1 : 0 };
+		} else if (target.transcriptSource?.type === "command" && target.transcriptSource.command) {
+			collected = await (deps?.collectTranscriptsFromCommandFn ?? collectTranscriptsFromCommand)(target.transcriptSource.command, target.lookbackDays, target.maxSessionBytes);
+		} else collected = await (deps?.collectTranscriptsFn ?? collectTranscripts)(target.lookbackDays, target.maxSessionBytes);
+		const sessions = collected.sessions;
+		run.sessionsExtracted = sessions?.length ?? collected.includedCount;
+		if (!collected.transcripts || !run.sessionsExtracted) return finish("no_data", "No substantive sessions found.");
+
+		const [provider, modelId] = target.model.split("/", 2);
+		const model = options?.currentModel ?? modelRegistry?.find?.(provider, modelId) ?? (deps?.getModel ?? (await import("@earendil-works/pi-ai/compat")).getModel)(provider, modelId);
+		if (!model) return finish("failed", "Configured model not found.");
+		let completeFn: (model: any, request: any, options: any) => Promise<any>;
+		let apiKey = options?.currentModelApiKey;
+		let headers = options?.currentModelHeaders;
+		if (deps?.completeSimple) completeFn = deps.completeSimple;
+		else if (typeof modelRegistry?.streamSimple === "function") {
+			completeFn = async (m, request, opts) => modelRegistry.streamSimple(m, request, { maxTokens: opts.maxTokens, reasoning: opts.reasoning }).result();
+		} else {
+			const auth = await resolveModelAuth(modelRegistry, model);
+			if (!auth.ok) return finish("failed", "Model authentication unavailable.");
+			apiKey = auth.apiKey; headers = auth.headers;
+			completeFn = (await import("@earendil-works/pi-ai/compat")).completeSimple;
+		}
+		const context = target.context?.length ? await collectContext(target.context, target.lookbackDays) : "";
+		const budget = Math.max(target.maxSessionBytes - original.length - context.length - 20_000, 100_000);
+		const batches = sessions?.length ? buildTranscriptBatches(sessions, budget) : [[collected.transcripts]];
+		run.truncatedSessions = sessions?.filter((s) => s.transcript.length + 6 > budget).length ?? 0;
+		const oldEvidence = new Set((deps?.loadHistoryFn ?? loadHistory)().filter((r) => r.targetPath === targetPath && r.status === "success" && !r.dryRun)
+			.flatMap((r) => (r.proposals ?? []).filter((p) => p.status === "applied").flatMap((p) => p.evidenceIds)));
+		const messages = sessions?.flatMap((s) => s.userMessages ?? []) ?? [];
+		let staged = original;
+		const summaries: string[] = [];
+		for (let i = 0; i < batches.length; i++) {
+			const transcript = sessions?.length ? formatBatchTranscripts(batches[i], i, batches.length, sessions.length) : batches[i][0];
+			let result: AnalysisResult | null;
+			try {
+				result = await analyzeTranscriptBatch(target, targetPath, staged, transcript, context, model, apiKey ?? "", headers, target.model, (message, level) => {
+					if (level === "error") run.failureReasons!.push(message.slice(0, 200));
+					notify(message, level);
+				}, completeFn);
+			} catch { run.failureReasons!.push("Model request failed before completion."); result = null; }
+			if (!result) { run.failedBatches!++; continue; }
+			run.successfulBatches!++;
+			run.sessionsAnalyzed += sessions?.length ? batches[i].length : collected.includedCount;
+			run.correctionsFound += result.correctionsFound;
+			if (result.usage) {
+				run.usage ??= { input: 0, output: 0, cost: 0 };
+				run.usage.input += result.usage.input; run.usage.output += result.usage.output; run.usage.cost += result.usage.cost;
+			}
+			if (result.summary) summaries.push(result.summary);
+			for (const edit of result.edits) {
+				const oldText = edit.old_text ?? edit.merge_sources?.join("\n") ?? "";
+				const proposal: Proposal = { type: edit.type, section: edit.section ?? "", oldText, newText: edit.new_text ?? "", reason: edit.reason ?? "", evidenceIds: [], status: "skipped", ruleId: createHash("sha256").update(oldText || edit.new_text || "").digest("hex").slice(0, 20) };
+				run.proposals!.push(proposal);
+				for (const item of Array.isArray(edit.evidence) ? edit.evidence : []) {
+					if (!item || typeof item.quote !== "string" || !item.quote.trim()) continue;
+					const message = messages.find((m) => m.sessionId === item.sessionId && m.messageId === item.messageId && m.timestamp === item.timestamp && m.text?.includes(item.quote) && transcript.includes(item.quote) && transcript.includes(`sessionId=${m.sessionId} messageId=${m.messageId} timestamp=${m.timestamp}`));
+					if (!message) continue;
+					const id = createHash("sha256").update(`${item.sessionId}:${item.messageId}`).digest("hex").slice(0, 24);
+					proposal.evidenceIds.push(id);
+					if (!run.evidence!.some((e) => e.id === id)) run.evidence!.push({ id, sessionId: item.sessionId, messageId: item.messageId, timestamp: item.timestamp, quote: item.quote, isNew: !oldEvidence.has(id) });
+				}
+				if (!proposal.evidenceIds.some((id) => !oldEvidence.has(id))) { proposal.approvalReason = "No verified new user correction evidence."; continue; }
+				const freshEvidence = run.evidence!.filter((e) => proposal.evidenceIds.includes(e.id) && e.isNew);
+				if (edit.type === "add" && (new Set(freshEvidence.map((e) => e.sessionId)).size < 2 || new Set(freshEvidence.map((e) => e.messageId)).size < 2)) { proposal.approvalReason = "Addition requires new corrections from two distinct sessions and messages."; continue; }
+				if (edit.type !== "add" || /\b(?:permission\w*|authori[sz]\w*|approv\w*|secur\w*|safet\w*|scope\w*|never|must not|do not|don't|forbid\w*|credential\w*|secret\w*|deploy\w*|commit\w*|push\w*|delet\w*|destruct\w*|external\w*|sandbox\w*|branch\w*|pull request\w*|pr\b|shared state|checkpoint\w*)\b/i.test(`${oldText}\n${edit.new_text}`)) {
+					proposal.status = "approval_required"; proposal.approvalReason = "Removal, merge, replacement, or sensitive rule requires approval."; continue;
+				}
+				const applied = applyEdits(staged, [edit]);
+				if (!applied.applied || applied.result === staged) { proposal.approvalReason = applied.skipped[0] ?? "No effective change."; continue; }
+				staged = applied.result;
+				proposal.status = "proposed";
+				for (const id of proposal.evidenceIds) oldEvidence.add(id);
+			}
+		}
+		run.proposedCount = run.proposals!.length;
+		run.skippedCount = run.proposals!.filter((p) => p.status === "skipped" || p.status === "approval_required").length;
+		if (run.failedBatches) return finish(run.successfulBatches ? "partial" : "failed", "Analysis incomplete; no changes applied.");
+		if (staged.length < original.length * 0.5) return finish("failed", "Proposed result is suspiciously small; no changes applied.");
+		if (!options?.dryRun && staged !== original) {
+			if (fs.readFileSync(targetPath, "utf-8") !== original) return finish("failed", "Target changed during analysis; no changes applied.");
+			const dir = resolvePath(target.backupDir);
+			fs.mkdirSync(dir, { recursive: true });
+			const backupPath = path.join(dir, `${path.basename(targetPath, ".md")}_${formatTimestamp()}_${Date.now()}.md`);
+			fs.writeFileSync(backupPath, original, { flag: "wx" });
+			if (fs.readFileSync(targetPath, "utf-8") !== original) return finish("failed", "Target changed before write; no changes applied.");
+			const realTarget = fs.realpathSync(targetPath);
+			const tempPath = path.join(path.dirname(realTarget), `.${path.basename(realTarget)}.${randomUUID()}.tmp`);
+			try {
+				const mode = fs.statSync(realTarget).mode & 0o7777;
+				fs.writeFileSync(tempPath, staged, { flag: "wx", mode });
+				fs.chmodSync(tempPath, mode);
+				if (fs.readFileSync(targetPath, "utf-8") !== original) return finish("failed", "Target changed before write; no changes applied.");
+				fs.renameSync(tempPath, realTarget);
+			} finally {
+				try { fs.unlinkSync(tempPath); } catch { /* renamed or never created */ }
+			}
+			run.backupPath = backupPath;
+			run.targetAfterHash = createHash("sha256").update(staged).digest("hex");
+			for (const proposal of run.proposals!) if (proposal.status === "proposed") { proposal.status = "applied"; run.editsApplied++; }
+		}
+		if (staged !== original && !options?.dryRun) {
+			const before = original.split("\n"), after = staged.split("\n");
+			for (let i = 0; i < Math.max(before.length, after.length); i++) if (before[i] !== after[i]) run.diffLines++;
+		}
+		run.correctionRate = run.sessionsAnalyzed ? run.correctionsFound / run.sessionsAnalyzed : null;
+		run.fileSize = computeFileMetrics(options?.dryRun ? original : staged);
+		return finish("success", summaries.join(" ") || "Analysis complete.");
+	} catch {
+		notify("Reflection failed during collection or application; no further changes attempted.", "error");
+		return finish("failed", "Reflection failed during collection or application.");
+	}
 }
 
 // Re-export path constants for the extension entry point

@@ -21,7 +21,7 @@ describe("collectTranscriptsFromCommand", () => {
 	});
 
 	it("counts ### Session: headers for session count", async () => {
-		const multiSession = "echo '### Session: one\\n### Session: two\\n### Session: three'";
+		const multiSession = "printf '### Session: one\\n### Session: two\\n### Session: three\\n'";
 		const result = await collectTranscriptsFromCommand(multiSession, 1, 1024 * 1024);
 		assert.equal(result.sessionCount, 3);
 	});
